@@ -1,0 +1,194 @@
+# Using this ruleset as an example for uni project, aiming to combat network attacks via stateful firewall. 
+# Not an ideal scenario but in terms of basic mitigation, all work.  
+
+# My bible - https://wiki.nftables.org/wiki-nftables/index.php/Main_Page
+# Thats no ordinary rabit, thats the most foul, cruel and bad tempered rodent youve ever set eyes on
+
+
+#Working
+	#Syn Flood/ Syn cookies - Y
+	#ICMP Flood - Y
+	#Brute force - Y
+	#Port Scanning - Y
+
+#Untested
+	#General - ?
+	
+#Advanced & Using
+	#Sets
+	#vmaps
+	#Variables 
+	#DIfferent chains
+	#Math operators
+	#SynProxy
+	#Concatination
+	#Rate Limiting
+	#Math operators
+	
+#Try in future
+	#Secmark
+	#Metering
+	#Maps
+	#Flowtabels 
+	#Timeouts
+	#Updating sets from packet path
+	#Connlimits
+	#Bash? - eliminates any atomicity
+	#Raw payload expression 
+
+
+#!/usr/sbin/nft -f
+
+
+flush ruleset
+
+
+define ports = 1-8080
+define eth = ens33
+define icmp_echo = echo-request
+define icmp6_types = { destination-unreachable, packet-too-big, parameter-problem, echo-reply, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert }
+define icmp4_types = { destination-unreachable, router-advertisement, time-exceeded, parameter-problem }
+define BOGONS = { 0.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/3 }
+
+
+table netdev filter {
+	chain ingress {
+		type filter hook ingress device $eth priority -500;
+
+
+		# Drop IPs from invalid (BOGON) networks
+		#ip saddr $BOGONS counter drop
+
+
+		# Drop fragmented packets 
+		ip frag-off & 0x1fff != 0 counter drop
+
+
+		# Drop XMAS packets 
+		tcp flags & (fin|psh|urg) == fin|psh|urg counter drop 
+		
+			
+		# Drop NULL packets
+		tcp flags & (fin|syn|rst|psh|ack|urg) == 0x0 counter drop
+
+
+		# Drop invalid MSS Values 
+		#tcp flags syn tcp option maxseg size 1-535 counter drop
+		
+		
+		#tcp flags != syn counter reject with icmp type host-unreachable #Drop new connections with anything other then a syn packet
+	}
+}
+
+
+
+table inet mangle{
+	set ICMPPrison {type ipv4_addr; flags dynamic,timeout; timeout 5m;}
+	set ICMP6Prison {type ipv6_addr; flags dynamic,timeout; timeout 5m;}
+	
+
+	chain synProxyPrerouting{
+		type filter hook prerouting priority raw; policy accept;
+
+
+        	tcp dport 80 tcp flags syn counter notrack
+	}
+	
+	
+	chain prerouting {
+		#ct registered at >-200 points, so using mangle (-150)
+		type filter hook prerouting priority mangle; policy drop;
+		
+		
+		#Smurf attack can come from many hosts/networks, so limiting my ability to recieve ICMP, instead of who I can recieve from.
+		#Only allow through 20 ICMP requests per minute, otherwise drop 
+		ip6 nexthdr icmpv6 icmpv6 type $icmp_echo limit rate over 20/minute counter add @ICMP6Prison { ip6 saddr } 
+		ip protocol icmp icmp type $icmp_echo limit rate 5/minute counter accept #add @ICMPPrison { ip saddr } 
+		ip saddr @ICMPPrison drop
+		
+		
+		#Allow general ICMPv4/6 packet types 
+		ip6 nexthdr icmpv6 icmpv6 type $icmp6_types accept
+		ip protocol icmp icmp type $icmp4_types accept
+	}
+}
+
+
+
+table inet filter {
+	set bfp {type ipv4_addr; flags dynamic,timeout; timeout 5m;}
+	set PortScanning {type ipv4_addr; flags dynamic,timeout; timeout 10m;}
+	
+	
+	chain input {
+		type filter hook input priority filter; policy accept;
+
+
+		iif != lo ip  daddr 127.0.0.1/8 counter drop  
+		iif != lo ip6 daddr ::1/128 counter drop 
+		iif lo accept 
+		
+		
+		tcp dport 80 ct state invalid, untracked counter synproxy mss 1460 wscale 7 timestamp sack-perm
+		
+		
+		tcp dport $ports ct state new, untracked counter jump PortScanning
+		
+		
+		#ip protocol . th dport vmap {tcp . 8080 : jump HTTP, tcp . 22 : jump SSH, udp . 53: accept, tcp . !=8080|80|22|53 : jump AOB} 
+		
+		
+		#tcp dport != {22|8080|53|} counter jump AOB
+		
+		ct state vmap {new | related | established : accept, invalid : drop}		
+	}
+	
+	
+	chain AOB{
+		#ct state new, limit rate over 10/minute counter jump SynProxy
+		#tcp dport . ct state vmap {80 . invalid : jump SynProxy, 22 . new : jump BruteForce} 
+		#ct state invalid counter drop
+	}
+	
+	
+	chain HTTP{
+		#ct state {new, related, established} counter accept
+	}
+	
+	
+	chain trafficWatch{
+		#tcp dport != {22|8080} jump AOB
+		#tcp dport vmap {8080 : jump HTTP, 22 : jump SSH}
+		
+		
+		#ct state {related, established} counter accept
+	}
+	
+	
+	chain SSH{ 
+		ct state new, untracked counter limit rate over 3/minute add @bfp { ip saddr }
+		ip saddr @bfp drop
+	}
+	
+	
+	chain PortScanning{
+		#Limit connections to ports 1-2048 to 10 per second, otherwise, add source IP to PortScanning set 
+		ct state new, untracked limit rate over 10/second add @PortScanning { ip saddr } counter
+		
+		
+		#Drop traffic with source IP in PortScanning set
+		ip saddr @PortScanning drop
+	}
+
+
+	chain forward {
+		type filter hook forward priority 0; policy drop;
+	}
+
+
+	chain output {
+		type filter hook output priority 0; policy accept;
+		
+		ct state invalid counter drop
+	}
+}
